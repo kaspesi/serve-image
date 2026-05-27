@@ -47,6 +47,13 @@ if [[ -f "$PID_FILE" ]]; then
   rm -f "$PID_FILE"
 fi
 
+# Fallback: kill anything still holding the port (stale PID file scenario)
+LINGERING="$(lsof -ti :"$PORT" 2>/dev/null || true)"
+if [[ -n "$LINGERING" ]]; then
+  echo "$LINGERING" | xargs kill -9 2>/dev/null || true
+  sleep 0.5
+fi
+
 # --- Discover Tailscale IP ---
 TAILSCALE_IP=""
 if [[ -x "$TAILSCALE_CLI" ]]; then

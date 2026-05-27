@@ -66,6 +66,7 @@ timer = threading.Timer(MINUTES * 60, shutdown_fn)
 timer.daemon = True
 timer.start()
 
+http.server.HTTPServer.allow_reuse_address = True
 server = http.server.HTTPServer(("0.0.0.0", PORT), ImageHandler)
 print(f"[serve-image] Serving {FILENAME} on port {PORT} for {MINUTES:.0f} min", flush=True)
 
