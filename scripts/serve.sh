@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
+# Back-compat shim: spawn the multi-image daemon if needed, register the given
+# image via its localhost control plane, and print the resulting URL.
+#
+# Usage: serve.sh <image-path> [minutes]
+#
+# Existing callers (the serve-image SKILL, show-me, etc.) continue to work
+# unchanged — only the URL shape changes (now tokenized).
+
 set -euo pipefail
 
-# Usage: serve.sh <image-path> [minutes]
-
-PORT=7890
-CACHE_DIR="$HOME/.cache/serve-image"
-PID_FILE="$CACHE_DIR/server.pid"
-LOG_FILE="$CACHE_DIR/server.log"
-TAILSCALE_CLI="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# --- Validate args ---
 if [[ $# -lt 1 ]]; then
   echo "Usage: serve.sh <image-path> [minutes]" >&2
   exit 1
 fi
 
 RAW_PATH="$1"
-MINUTES="${2:-30}"
+MINUTES="${2:-120}"
+PORT="${SERVE_IMAGE_PORT:-7890}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Resolve to absolute path
 if command -v realpath &>/dev/null; then
@@ -31,69 +31,45 @@ if [[ ! -f "$IMAGE" ]]; then
   exit 1
 fi
 
-FILENAME="$(basename "$IMAGE")"
+# Ensure the daemon is running.
+bash "$SCRIPT_DIR/daemon_spawn.sh"
 
-mkdir -p "$CACHE_DIR"
+# Register the image.
+RESPONSE="$(
+  python3 - "$IMAGE" "$MINUTES" "$PORT" <<'PYEOF'
+import json, sys, urllib.request, urllib.error
+path, minutes, port = sys.argv[1], float(sys.argv[2]), int(sys.argv[3])
+req = urllib.request.Request(
+    f"http://127.0.0.1:{port}/control/register",
+    data=json.dumps({"path": path, "minutes": minutes}).encode(),
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+try:
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        print(resp.read().decode())
+except urllib.error.HTTPError as e:
+    print(e.read().decode(), file=sys.stderr)
+    sys.exit(2)
+PYEOF
+)"
 
-# --- Kill previous server if running ---
-if [[ -f "$PID_FILE" ]]; then
-  OLD_PID="$(cat "$PID_FILE")"
-  if kill -0 "$OLD_PID" 2>/dev/null; then
-    COMM="$(ps -p "$OLD_PID" -o comm= 2>/dev/null || true)"
-    if [[ "$COMM" == *python* ]]; then
-      kill "$OLD_PID" 2>/dev/null || true
-    fi
-  fi
-  rm -f "$PID_FILE"
+URL="$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['url'])" "$RESPONSE")"
+TOKEN="$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['token'])" "$RESPONSE")"
+
+# Copy URL to clipboard (macOS).
+if command -v pbcopy &>/dev/null; then
+  printf "%s" "$URL" | pbcopy
 fi
-
-# Fallback: kill anything still holding the port (stale PID file scenario)
-LINGERING="$(lsof -ti :"$PORT" 2>/dev/null || true)"
-if [[ -n "$LINGERING" ]]; then
-  echo "$LINGERING" | xargs kill -9 2>/dev/null || true
-  sleep 0.5
-fi
-
-# --- Discover Tailscale IP ---
-TAILSCALE_IP=""
-if [[ -x "$TAILSCALE_CLI" ]]; then
-  TAILSCALE_IP="$("$TAILSCALE_CLI" ip -4 2>/dev/null | head -1 || true)"
-fi
-
-if [[ -z "$TAILSCALE_IP" ]]; then
-  # Fallback: parse ifconfig for 100.x.x.x
-  TAILSCALE_IP="$(ifconfig 2>/dev/null | grep -oE 'inet 100\.[0-9]+\.[0-9]+\.[0-9]+' | awk '{print $2}' | head -1 || true)"
-fi
-
-if [[ -z "$TAILSCALE_IP" ]]; then
-  echo "Error: no Tailscale IP found. Is Tailscale connected?" >&2
-  exit 1
-fi
-
-# --- Start server ---
-nohup python3 "$SCRIPT_DIR/server.py" "$IMAGE" "$PORT" "$MINUTES" > "$LOG_FILE" 2>&1 &
-SERVER_PID=$!
-disown "$SERVER_PID"
-echo "$SERVER_PID" > "$PID_FILE"
-
-sleep 0.5
-
-if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-  echo "Error: server failed to start. Log:" >&2
-  cat "$LOG_FILE" >&2
-  exit 1
-fi
-
-# --- Build URL and copy to clipboard ---
-ENCODED_FILENAME="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$FILENAME")"
-URL="http://${TAILSCALE_IP}:${PORT}/${ENCODED_FILENAME}"
-echo "$URL" | pbcopy
 
 EXPIRY="$(date -v +"${MINUTES}M" "+%H:%M" 2>/dev/null || date -d "+${MINUTES} minutes" "+%H:%M" 2>/dev/null || echo "in ${MINUTES} minutes")"
 
-echo ""
-echo "  Serving: $IMAGE"
-echo "  URL:     $URL"
-echo "  Copied:  URL is on your clipboard"
-echo "  Expires: ~${EXPIRY} (${MINUTES} min)"
-echo ""
+cat <<EOF
+
+  Serving: $IMAGE
+  URL:     $URL
+  Token:   $TOKEN
+  Copied:  URL is on your clipboard
+  Expires: ~${EXPIRY} (${MINUTES} min)
+
+EOF
