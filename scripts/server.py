@@ -38,13 +38,19 @@ with open(IMAGE_PATH, "rb") as f:
 
 
 class ImageHandler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
+    def _send_headers(self):
         self.send_response(200)
         self.send_header("Content-Type", MIME_TYPE)
         self.send_header("Content-Length", str(len(IMAGE_DATA)))
         self.send_header("Content-Disposition", f'inline; filename="{FILENAME}"')
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
+
+    def do_HEAD(self):
+        self._send_headers()
+
+    def do_GET(self):
+        self._send_headers()
         self.wfile.write(IMAGE_DATA)
 
     def log_message(self, format, *args):
