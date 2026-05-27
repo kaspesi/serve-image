@@ -78,7 +78,8 @@ if ! kill -0 "$SERVER_PID" 2>/dev/null; then
 fi
 
 # --- Build URL and copy to clipboard ---
-URL="http://${TAILSCALE_IP}:${PORT}/${FILENAME}"
+ENCODED_FILENAME="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$FILENAME")"
+URL="http://${TAILSCALE_IP}:${PORT}/${ENCODED_FILENAME}"
 echo "$URL" | pbcopy
 
 EXPIRY="$(date -v +"${MINUTES}M" "+%H:%M" 2>/dev/null || date -d "+${MINUTES} minutes" "+%H:%M" 2>/dev/null || echo "in ${MINUTES} minutes")"
