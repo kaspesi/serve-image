@@ -5,21 +5,29 @@ Serves registered images at /<token>/<filename> on a fixed port (default 7890),
 bound to 0.0.0.0 so Tailscale peers can reach them. Each image has its own TTL;
 expired entries are swept by a background thread.
 
-A localhost-only control plane under /control/* lets clients register, list,
-revoke, extend, and purge images. The MCP server and the serve.sh shim both
-talk to this control plane via HTTP on 127.0.0.1.
+Disk-backed: on register, the image is copied to ~/.cache/serve-image/blobs/<token>
+and served by streaming from disk on each request. The registry holds only
+metadata — no image bytes in RAM. Blobs are deleted on revoke/expire/purge,
+and the blobs/ dir is wiped at startup since the in-memory registry doesn't
+survive a restart.
 
-Pure stdlib. Logs to stderr. PID file at ~/.cache/serve-image/server.pid.
+A localhost-only control plane under /control/* lets clients register, list,
+revoke, extend, and purge images.
+
+Pure stdlib. Logs rotate at 1MiB × 2 backups (~3MiB cap).
 """
 
 from __future__ import annotations
 
 import http.server
 import json
+import logging
+import logging.handlers
 import mimetypes
 import os
 import re
 import secrets
+import shutil
 import socketserver
 import subprocess
 import sys
@@ -37,34 +45,74 @@ mimetypes.add_type("image/gif", ".gif")
 
 PORT = int(os.environ.get("SERVE_IMAGE_PORT", "7890"))
 CACHE_DIR = os.path.expanduser("~/.cache/serve-image")
+BLOB_DIR = os.path.join(CACHE_DIR, "blobs")
 PID_FILE = os.path.join(CACHE_DIR, "server.pid")
+LOG_FILE = os.path.join(CACHE_DIR, "server.log")
+
+# Disk-bloat guardrails.
+LOG_MAX_BYTES = 1 * 1024 * 1024            # 1 MiB per log file
+LOG_BACKUPS = 2                             # → ≤3 MiB on disk
+MAX_IMAGE_BYTES = 50 * 1024 * 1024         # 50 MiB per image
+MAX_TOTAL_BYTES = 1 * 1024 * 1024 * 1024   # 1 GiB total live blobs
+
+CHUNK_SIZE = 64 * 1024  # streaming read chunk
 
 START_TIME = time.time()
+LOGGER = logging.getLogger("serve-image-daemon")
+
+
+def _log(msg: str) -> None:
+    LOGGER.info(msg)
 
 
 class Registry:
+    """Metadata-only registry. Blob bytes live on disk at BLOB_DIR/<token>."""
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._items: Dict[str, Dict[str, Any]] = {}
 
+    def _total_bytes_locked(self) -> int:
+        return sum(it["size"] for it in self._items.values())
+
     def register(self, path: str, minutes: float) -> Dict[str, Any]:
         if not os.path.isfile(path):
             raise FileNotFoundError(path)
-        with open(path, "rb") as f:
-            data = f.read()
+        size = os.path.getsize(path)
+        if size > MAX_IMAGE_BYTES:
+            raise ValueError(f"image too large ({size} > {MAX_IMAGE_BYTES} bytes)")
+
+        token = secrets.token_urlsafe(8)
         filename = os.path.basename(path)
         mime, _ = mimetypes.guess_type(path)
         if not mime:
             mime = "application/octet-stream"
-        token = secrets.token_urlsafe(8)
+
+        blob_path = os.path.join(BLOB_DIR, token)
+        os.makedirs(BLOB_DIR, exist_ok=True)
+
+        with self._lock:
+            if self._total_bytes_locked() + size > MAX_TOTAL_BYTES:
+                raise MemoryError(
+                    f"registry would exceed {MAX_TOTAL_BYTES} bytes "
+                    "(use purge_all or revoke to free space)"
+                )
+
+        # Copy outside the lock — copy is the slow part.
+        shutil.copyfile(path, blob_path)
+        try:
+            os.chmod(blob_path, 0o600)
+        except OSError:
+            pass
+
         now = time.time()
         item = {
             "token": token,
             "path": path,
             "filename": filename,
             "mime": mime,
-            "data": data,
-            "size": len(data),
+            "blob_path": blob_path,
+            "size": size,
             "registered_at": now,
             "expires_at": now + minutes * 60.0,
             "hits": 0,
@@ -80,6 +128,7 @@ class Registry:
                 return None
             if item["expires_at"] < time.time():
                 self._items.pop(token, None)
+                self._delete_blob(item)
                 return None
             return item
 
@@ -96,13 +145,19 @@ class Registry:
 
     def revoke(self, token: str) -> bool:
         with self._lock:
-            return self._items.pop(token, None) is not None
+            item = self._items.pop(token, None)
+        if item:
+            self._delete_blob(item)
+            return True
+        return False
 
     def purge(self) -> int:
         with self._lock:
-            n = len(self._items)
+            items = list(self._items.values())
             self._items.clear()
-            return n
+        for it in items:
+            self._delete_blob(it)
+        return len(items)
 
     def extend(self, token: str, minutes: float) -> Optional[Dict[str, Any]]:
         with self._lock:
@@ -115,10 +170,21 @@ class Registry:
     def sweep(self) -> int:
         now = time.time()
         with self._lock:
-            expired = [t for t, it in self._items.items() if it["expires_at"] < now]
-            for t in expired:
+            expired = [(t, it) for t, it in self._items.items() if it["expires_at"] < now]
+            for t, _ in expired:
                 self._items.pop(t, None)
-            return len(expired)
+        for _, it in expired:
+            self._delete_blob(it)
+        return len(expired)
+
+    @staticmethod
+    def _delete_blob(item: Dict[str, Any]) -> None:
+        try:
+            os.unlink(item["blob_path"])
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            _log(f"failed to delete blob {item['blob_path']}: {e}")
 
     @staticmethod
     def _public(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -156,19 +222,21 @@ def _tailscale_ip() -> Optional[str]:
     return None
 
 
-def _log(msg: str) -> None:
-    print(f"[serve-image-daemon] {msg}", file=sys.stderr, flush=True)
-
-
 def _url_for(token: str, filename: str) -> str:
     ip = _tailscale_ip() or "127.0.0.1"
     return f"http://{ip}:{PORT}/{token}/{urllib.parse.quote(filename)}"
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
-    server_version = "serve-image/2.0"
+    server_version = "serve-image/2.1"
 
     def log_message(self, fmt: str, *args: Any) -> None:
+        # Suppress noisy health polls from daemon_spawn.sh.
+        try:
+            if self.path == "/control/health":
+                return
+        except AttributeError:
+            pass
         _log(f"{self.address_string()} - " + (fmt % args))
 
     def _is_localhost(self) -> bool:
@@ -200,16 +268,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not item or item["filename"] != filename:
             self._send_404()
             return
+        blob_path = item["blob_path"]
+        try:
+            f = open(blob_path, "rb")
+        except FileNotFoundError:
+            # Blob was deleted out from under us — drop registry entry too.
+            REGISTRY.revoke(token)
+            self._send_404()
+            return
         REGISTRY.touch(token)
-        data = item["data"]
-        self.send_response(200)
-        self.send_header("Content-Type", item["mime"])
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Content-Disposition", f'inline; filename="{filename}"')
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers()
-        if body:
-            self.wfile.write(data)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", item["mime"])
+            self.send_header("Content-Length", str(item["size"]))
+            self.send_header("Content-Disposition", f'inline; filename="{filename}"')
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            if body:
+                while True:
+                    chunk = f.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        finally:
+            f.close()
 
     def _dispatch_control_get(self, path: str) -> None:
         if not self._is_localhost():
@@ -251,6 +333,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pub = REGISTRY.register(img_path, minutes)
             except FileNotFoundError:
                 self._send_json(404, {"error": "file_not_found", "path": img_path})
+                return
+            except ValueError as e:
+                self._send_json(413, {"error": "image_too_large", "detail": str(e)})
+                return
+            except MemoryError as e:
+                self._send_json(507, {"error": "registry_full", "detail": str(e)})
                 return
             pub["url"] = _url_for(pub["token"], pub["filename"])
             pub["tailscale_ip"] = _tailscale_ip()
@@ -317,10 +405,32 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
 
 
+def _init_logging() -> None:
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    LOGGER.setLevel(logging.INFO)
+    handler = logging.handlers.RotatingFileHandler(
+        LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS
+    )
+    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    LOGGER.addHandler(handler)
+    LOGGER.propagate = False
+
+
 def _write_pid() -> None:
     os.makedirs(CACHE_DIR, exist_ok=True)
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
+
+
+def _wipe_blob_dir() -> None:
+    # In-memory registry doesn't survive restart, so any pre-existing blobs
+    # are orphans from a prior daemon run. Clear them.
+    if os.path.isdir(BLOB_DIR):
+        try:
+            shutil.rmtree(BLOB_DIR)
+        except OSError as e:
+            _log(f"failed to wipe stale blob dir: {e}")
+    os.makedirs(BLOB_DIR, exist_ok=True)
 
 
 def _sweep_loop() -> None:
@@ -332,7 +442,9 @@ def _sweep_loop() -> None:
 
 
 def main() -> None:
+    _init_logging()
     _write_pid()
+    _wipe_blob_dir()
     sweeper = threading.Thread(target=_sweep_loop, daemon=True)
     sweeper.start()
     httpd = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
@@ -341,6 +453,8 @@ def main() -> None:
         httpd.serve_forever()
     except KeyboardInterrupt:
         _log("shutting down")
+    finally:
+        REGISTRY.purge()
 
 
 if __name__ == "__main__":
