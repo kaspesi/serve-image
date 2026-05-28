@@ -52,7 +52,9 @@ Report the URL prominently. Tell the user:
 
 ## Architecture (for skills that compose on this)
 
-- One daemon process per machine, listening on `0.0.0.0:7890`. Image bytes are read into memory at registration time, so the file on disk can change without affecting served bytes.
+- One daemon process per machine, listening on `0.0.0.0:7890`.
+- **Disk-backed, never in-memory.** On register, the source file is copied to `~/.cache/serve-image/blobs/<token>` (`shutil.copyfile` — bytes go disk → disk, not through Python memory). On every request the blob is streamed back from disk in 64 KiB chunks straight to the socket; the full image is never buffered in RAM. The blob is the snapshot, so the source file on disk can change, move, or be deleted after registration without affecting served bytes. Blobs are deleted on revoke / expire / purge, and the entire `blobs/` dir is wiped on daemon startup.
+- Limits: 50 MiB per image, 1 GiB total live blobs.
 - Control plane (`/control/register`, `/control/list`, `/control/revoke`, `/control/purge`, `/control/extend`, `/control/health`) is localhost-only — only this machine can mutate the registry.
 - A background sweeper evicts expired entries every 30 seconds.
 - PID at `~/.cache/serve-image/server.pid`; logs at `~/.cache/serve-image/server.log`. `daemon_spawn.sh` uses `flock` so concurrent callers don't race to bind the port.
