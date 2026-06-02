@@ -227,6 +227,40 @@ def _url_for(token: str, filename: str) -> str:
     return f"http://{ip}:{PORT}/{token}/{urllib.parse.quote(filename)}"
 
 
+def _parse_range(header: Optional[str], size: int) -> Optional[Tuple[int, int]]:
+    """Parse a single-range `Range: bytes=start-end` header.
+
+    Returns inclusive (start, end) clamped to [0, size-1], or None when the
+    header is absent, malformed, multi-range, or unsatisfiable — in which case
+    the caller falls back to a normal 200 full-file response.
+    """
+    if not header or size <= 0:
+        return None
+    header = header.strip()
+    if not header.startswith("bytes=") or "," in header:
+        return None
+    spec = header[len("bytes="):].strip()
+    start_s, sep, end_s = spec.partition("-")
+    if not sep:
+        return None
+    try:
+        if start_s == "":
+            # Suffix range: last N bytes.
+            n = int(end_s)
+            if n <= 0:
+                return None
+            start = max(0, size - n)
+            end = size - 1
+        else:
+            start = int(start_s)
+            end = int(end_s) if end_s != "" else size - 1
+    except ValueError:
+        return None
+    if start < 0 or start >= size or end < start:
+        return None
+    return start, min(end, size - 1)
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "serve-image/2.1"
 
@@ -278,9 +312,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         REGISTRY.touch(token)
         try:
+            size = int(item["size"])
+            # Range requests let video players seek/stream without fetching the
+            # whole file. Images ignore this and just take the 200 path.
+            rng = _parse_range(self.headers.get("Range"), size)
+            if rng is not None:
+                start, end = rng  # inclusive byte offsets
+                length = end - start + 1
+                self.send_response(206)
+                self.send_header("Content-Type", item["mime"])
+                self.send_header("Content-Length", str(length))
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Disposition", f'inline; filename="{filename}"')
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                if body:
+                    f.seek(start)
+                    remaining = length
+                    while remaining > 0:
+                        chunk = f.read(min(CHUNK_SIZE, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+                return
+
             self.send_response(200)
             self.send_header("Content-Type", item["mime"])
-            self.send_header("Content-Length", str(item["size"]))
+            self.send_header("Content-Length", str(size))
+            self.send_header("Accept-Ranges", "bytes")
             self.send_header("Content-Disposition", f'inline; filename="{filename}"')
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
