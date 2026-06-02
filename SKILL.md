@@ -45,6 +45,7 @@ Resolve relative paths first with `realpath "<path>"`, or `python3 -c "import os
 
 Report the URL prominently. Tell the user:
 
+- **Surface it as a Markdown link — `[▶ Watch clip](<url>)` — never as image syntax `![](<url>)` and never as a bare URL.** For video especially, clients like the paseo app run `![](url)` through an image loader that fails on a video and shows "Image unavailable", making the link vanish; a bare URL often isn't tappable either. A `[label](url)` link always renders and opens in the browser. (For still images/GIFs an inline `![](url)` is fine since it can actually render.)
 - The URL works from any device on their Tailscale network.
 - It expires after the chosen number of minutes (default 2 hours).
 - macOS may show a firewall dialog on first run — click Allow.
