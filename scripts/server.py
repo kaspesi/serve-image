@@ -34,6 +34,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import urllib.request
 from typing import Any, Dict, Optional, Tuple
 
 mimetypes.add_type("image/webp", ".webp")
@@ -48,6 +49,14 @@ CACHE_DIR = os.path.expanduser("~/.cache/serve-image")
 BLOB_DIR = os.path.join(CACHE_DIR, "blobs")
 PID_FILE = os.path.join(CACHE_DIR, "server.pid")
 LOG_FILE = os.path.join(CACHE_DIR, "server.log")
+
+# Shared static assets (currently just Mermaid for the plan viewer). Served
+# read-only at /assets/<name>, lazy-downloaded once and cached. Self-hosting over
+# Tailscale keeps rendered plans offline-capable and leaks nothing externally.
+ASSET_DIR = os.path.join(CACHE_DIR, "assets")
+MERMAID_FILENAME = "mermaid.min.js"
+MERMAID_URL = "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"
+ASSET_SOURCES = {MERMAID_FILENAME: MERMAID_URL}
 
 # Disk-bloat guardrails.
 LOG_MAX_BYTES = 1 * 1024 * 1024            # 1 MiB per log file
@@ -227,6 +236,36 @@ def _url_for(token: str, filename: str) -> str:
     return f"http://{ip}:{PORT}/{token}/{urllib.parse.quote(filename)}"
 
 
+def _ensure_asset(name: str) -> Optional[str]:
+    """Return a local path to a known static asset, downloading it once if needed.
+
+    Only whitelisted assets are served. Returns None on unknown name or a failed
+    download (caller responds 404) — a plan still renders, just without diagrams.
+    """
+    name = os.path.basename(name)
+    src = ASSET_SOURCES.get(name)
+    if src is None:
+        return None
+    path = os.path.join(ASSET_DIR, name)
+    if os.path.isfile(path) and os.path.getsize(path) > 0:
+        return path
+    os.makedirs(ASSET_DIR, exist_ok=True)
+    tmp = path + ".tmp"
+    try:
+        with urllib.request.urlopen(src, timeout=20) as resp, open(tmp, "wb") as out:
+            shutil.copyfileobj(resp, out)
+        os.replace(tmp, path)
+        _log(f"downloaded asset {name} ({os.path.getsize(path)} bytes)")
+        return path
+    except Exception as e:  # noqa: BLE001 — network/IO; degrade gracefully
+        _log(f"asset download failed for {name}: {e!r}")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return None
+
+
 def _parse_range(header: Optional[str], size: int) -> Optional[Tuple[int, int]]:
     """Parse a single-range `Range: bytes=start-end` header.
 
@@ -354,6 +393,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
         finally:
             f.close()
 
+    def _serve_asset(self, name: str, body: bool) -> None:
+        path = _ensure_asset(name)
+        if not path:
+            self._send_404()
+            return
+        try:
+            size = os.path.getsize(path)
+            f = open(path, "rb")
+        except OSError:
+            self._send_404()
+            return
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/javascript; charset=utf-8")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            if body:
+                while True:
+                    chunk = f.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        finally:
+            f.close()
+
     def _dispatch_control_get(self, path: str) -> None:
         if not self._is_localhost():
             self._send_json(403, {"error": "forbidden"})
@@ -432,6 +497,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path.startswith("/control/"):
             self._dispatch_control_get(path)
             return
+        if path.startswith("/assets/"):
+            self._serve_asset(path[len("/assets/"):], body=True)
+            return
         parts = path.lstrip("/").split("/", 1)
         if len(parts) == 2 and parts[0] and parts[1]:
             token = parts[0]
@@ -444,6 +512,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path, _ = self._parse()
         if path.startswith("/control/"):
             self._send_404()
+            return
+        if path.startswith("/assets/"):
+            self._serve_asset(path[len("/assets/"):], body=False)
             return
         parts = path.lstrip("/").split("/", 1)
         if len(parts) == 2 and parts[0] and parts[1]:
