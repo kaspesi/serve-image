@@ -7,6 +7,10 @@ argument-hint: "<path-to-image> [duration-minutes]"
 
 Serve local image files over HTTP so they're accessible from any device on the Tailscale network (e.g. your phone). Backed by a single long-lived daemon on port 7890 that hosts every image at a unique tokenized URL: `http://<tailscale-ip>:7890/<token>/<filename>`. Multiple images coexist; each has its own TTL.
 
+> **Serving a Markdown plan instead of an image?** Use the **`serve-plan`** skill (or
+> the `mcp__serve-image__serve_plan` tool). It renders a `.md` plan/spec to a readable
+> web page (Markdown, tables, code, Mermaid) and serves it through this same daemon.
+
 ## How to serve an image
 
 Prefer the MCP tools when available — they let you reason about what's currently being served, revoke or extend specific images, and purge state. The `serve.sh` shim still works for simple one-shot serving and for downstream skills that call it directly.

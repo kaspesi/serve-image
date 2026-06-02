@@ -36,6 +36,10 @@ DAEMON_SPAWN = os.path.join(SCRIPT_DIR, "daemon_spawn.sh")
 SERVER_NAME = "serve-image"
 SERVER_VERSION = "2.0.0"
 
+# Make render_plan (sibling module) importable for the serve_plan tool.
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
 PROTOCOL_VERSIONS = {"2025-06-18", "2025-03-26", "2024-11-05"}
 
 
@@ -123,6 +127,37 @@ TOOLS = [
         },
     },
     {
+        "name": "serve_plan",
+        "description": (
+            "Render a local Markdown plan / spec / research doc to a clean, "
+            "mobile-friendly web page and serve it over the Tailscale network. "
+            "Returns a URL that works from any device on the tailnet — open it on a "
+            "phone to read or approve the plan. Markdown, tables, code, and Mermaid "
+            "diagrams are rendered. The page is a frozen snapshot; re-run to update. "
+            "Default TTL is 2 hours."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Absolute path to the .md plan file on this machine.",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Optional page title. Defaults to the first H1, then the filename.",
+                },
+                "minutes": {
+                    "type": "number",
+                    "description": "How long the URL should remain live, in minutes. Default 120.",
+                    "default": 120,
+                },
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "list_served",
         "description": "List all images currently being served, with their URLs, expirations, and hit counts.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
@@ -182,6 +217,44 @@ def tool_serve_image(args: Dict[str, Any]) -> Dict[str, Any]:
     return {"content": [{"type": "text", "text": summary}], "structuredContent": res}
 
 
+def tool_serve_plan(args: Dict[str, Any]) -> Dict[str, Any]:
+    path = args.get("path", "")
+    title = args.get("title") or None
+    minutes = float(args.get("minutes", 120))
+    if not path:
+        return {"isError": True, "content": [{"type": "text", "text": "path is required"}]}
+    abs_path = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isfile(abs_path):
+        return {"isError": True, "content": [{"type": "text", "text": f"file not found: {abs_path}"}]}
+
+    # Render Markdown → self-contained HTML, then hand the HTML to the normal
+    # serve path. The daemon serves it as a plain text/html blob (no daemon change).
+    try:
+        import render_plan
+        out_dir = os.path.join(os.path.expanduser("~/.cache/serve-image"), "plan_renders")
+        stem = os.path.splitext(os.path.basename(abs_path))[0] or "plan"
+        out_html = os.path.join(out_dir, f"{stem}.html")
+        render_plan.render_file(abs_path, out_html, title=title)
+    except Exception as e:  # noqa: BLE001 — surface render failure to the caller
+        return {"isError": True, "content": [{"type": "text", "text": f"render failed: {e}"}]}
+
+    err = ensure_daemon()
+    if err:
+        return {"isError": True, "content": [{"type": "text", "text": err}]}
+    res = http_call("POST", "/control/register", {"path": out_html, "minutes": minutes})
+    if "error" in res:
+        return {"isError": True, "content": [{"type": "text", "text": json.dumps(res)}]}
+    summary = (
+        f"Serving plan {res['filename']}\n"
+        f"Source:  {abs_path}\n"
+        f"URL:     {res['url']}\n"
+        f"Token:   {res['token']}\n"
+        f"Expires: {fmt_expiry(res['expires_at'])} (in {fmt_remaining(res['expires_at'])})"
+    )
+    res["source"] = abs_path
+    return {"content": [{"type": "text", "text": summary}], "structuredContent": res}
+
+
 def tool_list_served(_args: Dict[str, Any]) -> Dict[str, Any]:
     err = ensure_daemon()
     if err:
@@ -238,6 +311,7 @@ def tool_extend(args: Dict[str, Any]) -> Dict[str, Any]:
 
 TOOL_HANDLERS = {
     "serve_image": tool_serve_image,
+    "serve_plan": tool_serve_plan,
     "list_served": tool_list_served,
     "revoke": tool_revoke,
     "purge_all": tool_purge_all,
