@@ -25,7 +25,7 @@ ToolSearch(query: "select:mcp__serve-image__serve_image,mcp__serve-image__list_s
 
 Tools:
 
-- `mcp__serve-image__serve_image({ path, minutes? })` — register an image. Default TTL is 120 minutes. Returns `{url, token, expires_at, ...}`.
+- `mcp__serve-image__serve_image({ path, minutes? })` — register an image. Default TTL is 1440 minutes (24h). Returns `{url, token, expires_at, ...}`.
 - `mcp__serve-image__list_served()` — see every image currently being served, with URLs, expirations, and hit counts. **Call this first if the user might want to know what's already live.**
 - `mcp__serve-image__revoke({ token })` — stop serving one specific image.
 - `mcp__serve-image__purge_all()` — clear the registry entirely.
@@ -39,7 +39,7 @@ If the MCP tools aren't loaded yet, `ToolSearch` will surface them — they're r
 bash "${CLAUDE_SKILL_DIR}/scripts/serve.sh" <absolute-path> [minutes]
 ```
 
-- Default duration is 120 minutes.
+- Default duration is 1440 minutes (24h).
 - Spawns the daemon if not already running, registers the image, prints the URL, copies it to the clipboard.
 - Same daemon as the MCP tools — they share state.
 
@@ -51,7 +51,7 @@ Report the URL prominently. Tell the user:
 
 - **Surface it as a Markdown link — `[▶ Watch clip](<url>)` — never as image syntax `![](<url>)` and never as a bare URL.** For video especially, clients like the paseo app run `![](url)` through an image loader that fails on a video and shows "Image unavailable", making the link vanish; a bare URL often isn't tappable either. A `[label](url)` link always renders and opens in the browser. (For still images/GIFs an inline `![](url)` is fine since it can actually render.)
 - The URL works from any device on their Tailscale network.
-- It expires after the chosen number of minutes (default 2 hours).
+- It expires after the chosen number of minutes (default 24 hours).
 - macOS may show a firewall dialog on first run — click Allow.
 - Other images may still be live; use `list_served` to check, `revoke`/`purge_all` to clean up.
 

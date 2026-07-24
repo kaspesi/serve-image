@@ -107,7 +107,7 @@ TOOLS = [
         "description": (
             "Serve a local image over HTTP on the Tailscale network. "
             "Returns a unique URL that works from any device on the tailnet. "
-            "Multiple images can be served concurrently. Default TTL is 2 hours."
+            "Multiple images can be served concurrently. Default TTL is 24 hours."
         ),
         "inputSchema": {
             "type": "object",
@@ -118,8 +118,8 @@ TOOLS = [
                 },
                 "minutes": {
                     "type": "number",
-                    "description": "How long the URL should remain live, in minutes. Default 120.",
-                    "default": 120,
+                    "description": "How long the URL should remain live, in minutes. Default 1440 (24h).",
+                    "default": 1440,
                 },
             },
             "required": ["path"],
@@ -134,7 +134,7 @@ TOOLS = [
             "Returns a URL that works from any device on the tailnet — open it on a "
             "phone to read or approve the plan. Markdown, tables, code, and Mermaid "
             "diagrams are rendered. The page is a frozen snapshot; re-run to update. "
-            "Default TTL is 2 hours."
+            "Default TTL is 24 hours."
         ),
         "inputSchema": {
             "type": "object",
@@ -149,8 +149,8 @@ TOOLS = [
                 },
                 "minutes": {
                     "type": "number",
-                    "description": "How long the URL should remain live, in minutes. Default 120.",
-                    "default": 120,
+                    "description": "How long the URL should remain live, in minutes. Default 1440 (24h).",
+                    "default": 1440,
                 },
             },
             "required": ["path"],
@@ -195,7 +195,7 @@ TOOLS = [
 
 def tool_serve_image(args: Dict[str, Any]) -> Dict[str, Any]:
     path = args.get("path", "")
-    minutes = float(args.get("minutes", 120))
+    minutes = float(args.get("minutes", 1440))
     if not path:
         return {"isError": True, "content": [{"type": "text", "text": "path is required"}]}
     abs_path = os.path.abspath(os.path.expanduser(path))
@@ -220,7 +220,7 @@ def tool_serve_image(args: Dict[str, Any]) -> Dict[str, Any]:
 def tool_serve_plan(args: Dict[str, Any]) -> Dict[str, Any]:
     path = args.get("path", "")
     title = args.get("title") or None
-    minutes = float(args.get("minutes", 120))
+    minutes = float(args.get("minutes", 1440))
     if not path:
         return {"isError": True, "content": [{"type": "text", "text": "path is required"}]}
     abs_path = os.path.abspath(os.path.expanduser(path))

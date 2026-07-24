@@ -15,7 +15,7 @@ if [[ $# -lt 1 ]]; then
 fi
 
 RAW_PATH="$1"
-MINUTES="${2:-120}"
+MINUTES="${2:-1440}"
 PORT="${SERVE_IMAGE_PORT:-7890}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

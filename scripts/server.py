@@ -451,7 +451,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/control/register":
             try:
                 img_path = body["path"]
-                minutes = float(body.get("minutes", 120))
+                minutes = float(body.get("minutes", 1440))
             except (KeyError, TypeError, ValueError):
                 self._send_json(400, {"error": "bad_request"})
                 return
