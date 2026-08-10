@@ -217,7 +217,11 @@ def _tailscale_ip() -> Optional[str]:
         try:
             out = subprocess.check_output([cli, "ip", "-4"], stderr=subprocess.DEVNULL, timeout=2)
             ip = out.decode().strip().splitlines()[0].strip()
-            if ip:
+            # The CLI can exit 0 while printing an error line to stdout (e.g.
+            # "The Tailscale CLI failed to start: Failed to load preferences.").
+            # Only accept something that actually parses as an IPv4 address, so
+            # a message falls through to the ifconfig scan below.
+            if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", ip):
                 return ip
         except Exception:
             pass
