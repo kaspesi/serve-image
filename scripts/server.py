@@ -212,26 +212,45 @@ REGISTRY = Registry()
 
 
 def _tailscale_ip() -> Optional[str]:
-    cli = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
-    if os.access(cli, os.X_OK):
+    # Explicit override wins — lets a caller pin the advertised host regardless
+    # of interface discovery.
+    override = os.environ.get("SERVE_IMAGE_PUBLIC_HOST", "").strip()
+    if override:
+        return override
+
+    # `tailscale ip -4` is the authoritative source. Try the macOS app bundle
+    # AND the plain `tailscale` binary on PATH (Linux/Homebrew), since the fleet
+    # spans both — a Linux host (net-tools absent) reached neither before, so the
+    # gallery embedded 127.0.0.1 URLs a remote tailnet viewer can't load.
+    cli_candidates = [
+        "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+        shutil.which("tailscale"),
+    ]
+    for cli in cli_candidates:
+        if not cli:
+            continue
         try:
             out = subprocess.check_output([cli, "ip", "-4"], stderr=subprocess.DEVNULL, timeout=2)
             ip = out.decode().strip().splitlines()[0].strip()
             # The CLI can exit 0 while printing an error line to stdout (e.g.
             # "The Tailscale CLI failed to start: Failed to load preferences.").
             # Only accept something that actually parses as an IPv4 address, so
-            # a message falls through to the ifconfig scan below.
+            # a message falls through to the interface scans below.
             if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", ip):
                 return ip
         except Exception:
             pass
-    try:
-        out = subprocess.check_output(["ifconfig"], stderr=subprocess.DEVNULL, timeout=2).decode()
-        m = re.search(r"inet (100\.\d+\.\d+\.\d+)", out)
-        if m:
-            return m.group(1)
-    except Exception:
-        pass
+    # Interface scans for hosts where the CLI is unavailable. `ip -4 addr` is the
+    # Linux default (ifconfig/net-tools is frequently not installed); `ifconfig`
+    # is the macOS/BSD fallback.
+    for cmd in (["ip", "-4", "addr"], ["ifconfig"]):
+        try:
+            out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=2).decode()
+            m = re.search(r"inet (100\.\d+\.\d+\.\d+)", out)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
     return None
 
 
