@@ -260,7 +260,15 @@ table { border-collapse: collapse; width: 100%; display: block; overflow-x: auto
 th, td { border: 1px solid #d8dade; padding: .5rem .7rem; text-align: left; }
 th { background: #f0f1f3; font-weight: 650; }
 tr:nth-child(even) td { background: #fafbfc; }
-img { max-width: 100%; height: auto; border-radius: 6px; }
+/* Text stays in the 820px column; images break out of it and use the whole
+   viewport width (centred on the column), at natural size up to the screen. */
+img {
+  display: block; height: auto; border-radius: 6px;
+  width: auto; max-width: calc(100vw - 1.5rem);
+  position: relative; left: 50%; transform: translateX(-50%);
+  margin: 0 0 1rem;
+}
+body { overflow-x: hidden; }
 hr { border: none; border-top: 1px solid #e3e5e8; margin: 2rem 0; }
 @media (prefers-color-scheme: dark) {
   body { color: #e4e6eb; background: #18191a; }
