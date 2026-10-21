@@ -13,16 +13,23 @@ Renderer preference:
   1. mistune (high-fidelity GFM: tables, strikethrough, task lists) if importable
   2. a built-in minimal Markdown→HTML converter otherwise (never hard-fails)
 
-CLI:  render_plan.py <plan.md> [out.html] [--title "..."]
+Images get Wide / Full screen controls. Local/relative image paths are embedded
+as base64 data URIs (up to 15 MB each) so the single .html file serves alone;
+pass --no-embed (or embed_images=False) to keep the original src.
+
+CLI:  render_plan.py <plan.md> [out.html] [--title "..."] [--no-embed]
 """
 
 from __future__ import annotations
 
+import base64
 import datetime
 import html
+import mimetypes
 import os
 import re
 import sys
+import urllib.parse
 from typing import Optional
 
 
@@ -189,6 +196,49 @@ def render_body(md_text: str) -> str:
     return _render_body_mistune(md_text) or _render_body_fallback(md_text)
 
 
+# ── Image post-processing ─────────────────────────────────────────────────────
+
+MAX_EMBED_BYTES = 15 * 1024 * 1024
+_IMG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
+_SRC_RE = re.compile(r"""\bsrc\s*=\s*("([^"]*)"|'([^']*)')""", re.IGNORECASE)
+_SCHEME_RE = re.compile(r"^(?:[a-zA-Z][a-zA-Z0-9+.-]*:|//)")
+
+
+def _data_uri(src: str, base_dir: str) -> Optional[str]:
+    """Local/relative image path → base64 data URI. None leaves the src as is
+    (remote URL, data URI, missing file, unknown type, or over the size cap)."""
+    if not src or _SCHEME_RE.match(src):
+        return None
+    path = urllib.parse.unquote(re.split(r"[?#]", src, maxsplit=1)[0])
+    path = os.path.join(base_dir, os.path.expanduser(path))
+    mime = mimetypes.guess_type(path)[0]
+    if not mime or not mime.startswith("image/") or not os.path.isfile(path):
+        return None
+    if os.path.getsize(path) > MAX_EMBED_BYTES:
+        print(f"render_plan: not embedding {path} (over 15 MB)", file=sys.stderr)
+        return None
+    with open(path, "rb") as f:
+        return f"data:{mime};base64," + base64.b64encode(f.read()).decode("ascii")
+
+
+def process_images(body_html: str, base_dir: Optional[str] = None) -> str:
+    """Wrap every <img> in a .pimg span (gets Wide / Full screen controls client-side).
+    With base_dir set, local image paths are embedded as data URIs."""
+
+    def one(m: "re.Match[str]") -> str:
+        tag = m.group(0)
+        if base_dir is not None:
+            sm = _SRC_RE.search(tag)
+            if sm:
+                raw = sm.group(2) if sm.group(2) is not None else sm.group(3)
+                uri = _data_uri(html.unescape(raw), base_dir)
+                if uri:
+                    tag = tag[: sm.start()] + f'src="{uri}"' + tag[sm.end():]
+        return f'<span class="pimg">{tag}</span>'
+
+    return _IMG_RE.sub(one, body_html)
+
+
 # ── Page assembly ─────────────────────────────────────────────────────────────
 
 _CSS = """
@@ -244,13 +294,6 @@ pre.mermaid svg { height: auto; max-width: none; cursor: zoom-in; }
   display: block; margin: -.6rem 0 1rem; font-size: .72rem; color: #8a8d91;
   text-align: center;
 }
-.mm-overlay {
-  position: fixed; inset: 0; z-index: 50; overflow: auto;
-  background: rgba(255,255,255,.98); -webkit-overflow-scrolling: touch;
-  display: flex; align-items: flex-start; justify-content: center; padding: 1rem;
-  touch-action: pinch-zoom;
-}
-.mm-overlay svg { width: 200%; max-width: none; height: auto; }
 .mm-close {
   position: fixed; top: .6rem; right: .8rem; z-index: 51;
   font-size: 1.4rem; line-height: 1; padding: .3rem .6rem; border-radius: 8px;
@@ -261,6 +304,43 @@ th, td { border: 1px solid #d8dade; padding: .5rem .7rem; text-align: left; }
 th { background: #f0f1f3; font-weight: 650; }
 tr:nth-child(even) td { background: #fafbfc; }
 img { max-width: 100%; height: auto; border-radius: 6px; }
+/* Images (and mermaid diagrams) sit inline in the text column by default. The
+   corner controls toggle "wide" (break out to the viewport minus a gutter,
+   centred, natural size up to that) or open the full-screen viewer. */
+.pimg {
+  display: block; position: relative; width: fit-content; max-width: 100%;
+  margin: 0 auto 1rem;
+}
+.pimg > img { display: block; cursor: zoom-in; }
+.pimg > pre.mermaid { margin: 0; }
+.pimg.wide {
+  width: max-content; max-width: calc(100vw - 1.5rem); margin-left: 0;
+  left: 50%; transform: translateX(-50%);
+}
+.pctl {
+  position: absolute; top: .4rem; right: .4rem; z-index: 2; display: flex; gap: .25rem;
+  opacity: 0; transition: opacity .15s;
+}
+.pimg:hover > .pctl, .pctl:focus-within { opacity: 1; }
+@media (hover: none) { .pctl { opacity: .9; } }
+.pctl button {
+  font: 600 .7rem/1 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  padding: .32rem .5rem; border-radius: 6px; cursor: pointer;
+  color: #1c1e21; background: rgba(255,255,255,.88); border: 1px solid #d8dade;
+  backdrop-filter: blur(4px);
+}
+.pctl button:hover { background: #fff; }
+.pctl button[aria-pressed="true"] { background: #2563eb; color: #fff; border-color: #2563eb; }
+.pv-overlay {
+  position: fixed; inset: 0; z-index: 50; overflow: hidden;
+  background: #ffffff; touch-action: none; cursor: grab;
+}
+.pv-overlay > .pv-stage { position: absolute; left: 0; top: 0; transform-origin: 0 0; max-width: none; }
+.pv-overlay > img.pv-stage { border-radius: 0; }
+.pv-hint {
+  position: fixed; bottom: .6rem; left: 50%; transform: translateX(-50%); z-index: 51;
+  font-size: .72rem; color: #8a8d91; pointer-events: none; white-space: nowrap;
+}
 hr { border: none; border-top: 1px solid #e3e5e8; margin: 2rem 0; }
 @media (prefers-color-scheme: dark) {
   body { color: #e4e6eb; background: #18191a; }
@@ -271,13 +351,172 @@ hr { border: none; border-top: 1px solid #e3e5e8; margin: 2rem 0; }
   code { background: #2a2c2e; }
   pre { background: #1f2123; border-color: #303234; }
   pre.mermaid { background: transparent; }
-  .mm-overlay { background: rgba(24,25,26,.985); }
+  .pv-overlay { background: #18191a; }
+  .pctl button { color: #e4e6eb; background: rgba(36,38,40,.88); border-color: #3a3d42; }
+  .pctl button:hover { background: #242628; }
+  .pctl button[aria-pressed="true"] { background: #6ea8fe; color: #18191a; border-color: #6ea8fe; }
   .mm-close { background: #e4e6eb; color: #18191a; }
   th, td { border-color: #3a3d42; }
   th { background: #242628; }
   tr:nth-child(even) td { background: #1d1f21; }
   hr { border-color: #303234; }
 }
+"""
+
+_VIEWER_JS = """
+<script>
+  // Per-image controls (Wide / Full screen) and the full-screen viewer, shared by
+  // <img> figures and rendered mermaid diagrams.
+  (function () {
+    function btn(label, title) {
+      var b = document.createElement('button');
+      b.type = 'button'; b.textContent = label; b.title = title;
+      return b;
+    }
+    // wrap: the .pimg element; media: the <img> or <svg> shown full screen.
+    function wire(wrap, media) {
+      if (wrap.querySelector(':scope > .pctl')) return;
+      var bar = document.createElement('span');
+      bar.className = 'pctl';
+      var wide = btn('Wide', 'Toggle full page width');
+      wide.setAttribute('aria-pressed', 'false');
+      var full = btn('\\u26f6 Full screen', 'Open full screen');
+      wide.addEventListener('click', function (e) {
+        e.stopPropagation();
+        var on = wrap.classList.toggle('wide');
+        wide.setAttribute('aria-pressed', on ? 'true' : 'false');
+      });
+      full.addEventListener('click', function (e) { e.stopPropagation(); openViewer(media); });
+      media.addEventListener('click', function () { openViewer(media); });
+      bar.appendChild(wide); bar.appendChild(full);
+      wrap.appendChild(bar);
+    }
+
+    function openViewer(media) {
+      var natW, natH, stage;
+      if (media.tagName.toLowerCase() === 'img') {
+        natW = media.naturalWidth || media.width; natH = media.naturalHeight || media.height;
+        stage = document.createElement('img');
+        stage.src = media.currentSrc || media.src; stage.alt = media.alt || '';
+      } else {
+        var r = media.getBoundingClientRect();
+        natW = r.width; natH = r.height;
+        stage = media.cloneNode(true);
+        stage.setAttribute('width', natW); stage.setAttribute('height', natH);
+        stage.style.cursor = 'inherit';
+      }
+      if (!natW || !natH) return;
+      stage.classList.add('pv-stage');
+      stage.style.width = natW + 'px'; stage.style.height = natH + 'px';
+      stage.draggable = false;
+
+      var o = document.createElement('div');
+      o.className = 'pv-overlay';
+      o.setAttribute('role', 'dialog'); o.setAttribute('aria-modal', 'true');
+      o.appendChild(stage);
+      var close = btn('\\u2715', 'Close (Esc)');
+      close.className = 'mm-close'; close.setAttribute('aria-label', 'Close');
+      var hint = document.createElement('span');
+      hint.className = 'pv-hint';
+      var touch = window.matchMedia && window.matchMedia('(hover: none)').matches;
+      hint.textContent = touch ? 'pinch to zoom \\u00b7 drag to pan \\u00b7 tap to toggle 100%'
+                               : 'scroll to zoom \\u00b7 drag to pan \\u00b7 click to toggle 100% / fit';
+
+      var s = 1, x = 0, y = 0, fit = 1;
+      function W() { return window.innerWidth; }
+      function H() { return window.innerHeight; }
+      function apply() {
+        var w = natW * s, h = natH * s;
+        // centre an axis that fits, otherwise keep its edges outside the viewport
+        x = w <= W() ? (W() - w) / 2 : Math.min(0, Math.max(W() - w, x));
+        y = h <= H() ? (H() - h) / 2 : Math.min(0, Math.max(H() - h, y));
+        stage.style.transform = 'translate(' + x + 'px,' + y + 'px) scale(' + s + ')';
+      }
+      function zoomAt(cx, cy, ns) {
+        ns = Math.max(fit / 2, Math.min(8, ns));
+        x = cx - (cx - x) * ns / s; y = cy - (cy - y) * ns / s; s = ns;
+        apply();
+      }
+      function refit() {
+        fit = Math.min((W() - 16) / natW, (H() - 16) / natH);
+        s = fit; apply();
+      }
+      function inside(cx, cy) {
+        return cx >= x && cx <= x + natW * s && cy >= y && cy <= y + natH * s;
+      }
+
+      var pts = {}, moved = false, last = null, pinch = null;
+      function count() { return Object.keys(pts).length; }
+      function two() { var k = Object.keys(pts); return [pts[k[0]], pts[k[1]]]; }
+      o.addEventListener('pointerdown', function (e) {
+        if (e.target === close) return;
+        pts[e.pointerId] = { x: e.clientX, y: e.clientY };
+        try { o.setPointerCapture(e.pointerId); } catch (_) {}
+        if (count() === 1) { moved = false; last = { x: e.clientX, y: e.clientY }; }
+        if (count() === 2) {
+          var p = two();
+          pinch = { d: Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y) || 1, s: s };
+          moved = true;
+        }
+      });
+      o.addEventListener('pointermove', function (e) {
+        if (!pts[e.pointerId]) return;
+        pts[e.pointerId] = { x: e.clientX, y: e.clientY };
+        if (count() >= 2 && pinch) {
+          var p = two();
+          var d = Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y);
+          zoomAt((p[0].x + p[1].x) / 2, (p[0].y + p[1].y) / 2, pinch.s * d / pinch.d);
+        } else if (count() === 1 && last) {
+          var dx = e.clientX - last.x, dy = e.clientY - last.y;
+          if (Math.abs(dx) + Math.abs(dy) > 3) moved = true;
+          if (moved) { x += dx; y += dy; apply(); }
+          last = { x: e.clientX, y: e.clientY };
+        }
+      });
+      function up(e) {
+        if (!pts[e.pointerId]) return;
+        delete pts[e.pointerId];
+        if (count() < 2) pinch = null;
+        if (count() === 1) { var k = Object.keys(pts)[0]; last = pts[k]; return; }
+        last = null;
+        if (moved || e.type === 'pointercancel') return;
+        if (!inside(e.clientX, e.clientY)) { dismiss(); return; }
+        // click / tap on the image toggles fit <-> 100% (2x if 100% already fits)
+        var target = Math.abs(s - fit) < 1e-3 ? (fit < 1 ? 1 : fit * 2) : fit;
+        zoomAt(e.clientX, e.clientY, target);
+      }
+      o.addEventListener('pointerup', up);
+      o.addEventListener('pointercancel', up);
+      o.addEventListener('wheel', function (e) {
+        e.preventDefault();
+        zoomAt(e.clientX, e.clientY, s * Math.exp(-e.deltaY * 0.0025));
+      }, { passive: false });
+
+      var prevOverflow = document.documentElement.style.overflow;
+      function onKey(e) { if (e.key === 'Escape') dismiss(); }
+      function dismiss() {
+        o.remove(); close.remove(); hint.remove();
+        document.documentElement.style.overflow = prevOverflow;
+        document.removeEventListener('keydown', onKey);
+        window.removeEventListener('resize', refit);
+      }
+      close.addEventListener('click', dismiss);
+      document.addEventListener('keydown', onKey);
+      window.addEventListener('resize', refit);
+      document.documentElement.style.overflow = 'hidden';
+      document.body.appendChild(o);
+      document.body.appendChild(close);
+      document.body.appendChild(hint);
+      refit();
+      close.focus();
+    }
+
+    window.__planViewer = { wire: wire, open: openViewer };
+    document.querySelectorAll('.pimg > img').forEach(function (img) {
+      wire(img.parentNode, img);
+    });
+  })();
+</script>
 """
 
 _MERMAID_BOOT = """
@@ -300,39 +539,26 @@ _MERMAID_BOOT = """
         er: noShrink, gantt: noShrink, journey: noShrink, pie: noShrink
       });
       var run = window.mermaid.run({ querySelector: '.mermaid' });
-      Promise.resolve(run).then(addZoom).catch(function (e) {
+      Promise.resolve(run).then(addControls).catch(function (e) {
         console.error('mermaid render failed', e);
       });
     } catch (e) { console.error('mermaid render failed', e); }
 
-    // Tap any diagram to open a fullscreen, pinch-zoomable overlay.
-    function addZoom() {
+    // Give each diagram the same Wide / Full screen controls as images.
+    function addControls() {
       document.querySelectorAll('pre.mermaid').forEach(function (pre) {
         var svg = pre.querySelector('svg');
-        if (!svg) return;
+        if (!svg || !window.__planViewer) return;
+        var wrap = document.createElement('div');
+        wrap.className = 'pimg';
+        pre.parentNode.insertBefore(wrap, pre);
+        wrap.appendChild(pre);
         var hint = document.createElement('span');
         hint.className = 'mm-hint';
         hint.textContent = 'tap diagram to zoom';
-        pre.insertAdjacentElement('afterend', hint);
-        svg.addEventListener('click', function () { openOverlay(svg); });
+        wrap.insertAdjacentElement('afterend', hint);
+        window.__planViewer.wire(wrap, svg);
       });
-    }
-    function openOverlay(svg) {
-      var o = document.createElement('div');
-      o.className = 'mm-overlay';
-      var clone = svg.cloneNode(true);
-      clone.removeAttribute('width');
-      clone.removeAttribute('height');
-      o.appendChild(clone);
-      var close = document.createElement('button');
-      close.className = 'mm-close';
-      close.setAttribute('aria-label', 'Close');
-      close.textContent = '\\u2715';
-      function dismiss() { o.remove(); close.remove(); }
-      close.addEventListener('click', dismiss);
-      o.addEventListener('click', function (e) { if (e.target === o) dismiss(); });
-      document.body.appendChild(o);
-      document.body.appendChild(close);
     }
   })();
 </script>
@@ -359,19 +585,26 @@ def build_page(body_html: str, *, title: str, source_label: str, rendered_at: st
         "</head>\n<body>\n"
         f'<div class="wrap">\n<div class="provenance">{prov}</div>\n'
         f"{body_html}\n</div>\n"
-        f"{_MERMAID_BOOT}\n"
+        f"{_VIEWER_JS}\n{_MERMAID_BOOT}\n"
         "</body>\n</html>\n"
     )
 
 
-def render_file(md_path: str, out_path: Optional[str] = None, *, title: Optional[str] = None) -> str:
+def render_file(
+    md_path: str,
+    out_path: Optional[str] = None,
+    *,
+    title: Optional[str] = None,
+    embed_images: bool = True,
+) -> str:
     md_path = os.path.abspath(os.path.expanduser(md_path))
     with open(md_path, "r", encoding="utf-8") as f:
         md_text = f.read()
     page_title = title or _derive_title(md_text, os.path.basename(md_path))
     rendered_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    base_dir = os.path.dirname(md_path) if embed_images else None
     page = build_page(
-        render_body(md_text),
+        process_images(render_body(md_text), base_dir),
         title=page_title,
         source_label=md_path,
         rendered_at=rendered_at,
@@ -386,6 +619,8 @@ def render_file(md_path: str, out_path: Optional[str] = None, *, title: Optional
 
 
 def main(argv: list[str]) -> int:
+    embed = "--no-embed" not in argv
+    argv = [a for a in argv if a != "--no-embed"]
     args = [a for a in argv if a != "--title"]
     title = None
     if "--title" in argv:
@@ -394,12 +629,12 @@ def main(argv: list[str]) -> int:
             title = argv[idx + 1]
             args = [a for a in args if a != title]
     if not args:
-        print("usage: render_plan.py <plan.md> [out.html] [--title TITLE]", file=sys.stderr)
+        print("usage: render_plan.py <plan.md> [out.html] [--title TITLE] [--no-embed]", file=sys.stderr)
         return 2
     md_path = args[0]
     out_path = args[1] if len(args) > 1 else None
     try:
-        out = render_file(md_path, out_path, title=title)
+        out = render_file(md_path, out_path, title=title, embed_images=embed)
     except FileNotFoundError:
         print(f"file not found: {md_path}", file=sys.stderr)
         return 1
